@@ -1,0 +1,15 @@
+numpy
+pandas
+yfinance
+scikit-learn
+xgboost
+lightgbm
+tensorflow
+keras
+transformers
+torch
+aiohttp
+python-telegram-bot
+praw
+pytrends
+joblib
