@@ -2,7 +2,7 @@ name: Penny Stock Bot
 
 on:
   schedule:
-    - cron: '0 5,7,9,11,13 * * 1-5'  # Run Monday-Friday, 08:00-17:00 IDT (05:00-13:00 UTC)
+    - cron: '30,0 13-20 * * 1-5'  # Run Monday-Friday, 16:30-23:00 IDT (13:30-20:00 UTC)
   workflow_dispatch:  # Allow manual trigger
 
 jobs:
