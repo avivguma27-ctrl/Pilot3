@@ -1,0 +1,36 @@
+name: Penny Stock Bot
+
+on:
+  schedule:
+    - cron: '0 5,7,9,11,13 * * 1-5'  # Run Monday-Friday, 08:00-17:00 IDT (05:00-13:00 UTC)
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot
+        run: python bot.py
+
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: bot-results
+          path: |
+            top_stocks.csv
+            bot.log
+            penny_stocks.db
