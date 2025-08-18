@@ -17,6 +17,7 @@ from transformers import pipeline
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import warnings
+from io import StringIO
 warnings.filterwarnings('ignore', category=FutureWarning)
 
 # ============================== #
@@ -26,12 +27,12 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 DB_FILE = "penny_stocks.db"
 LOG_FILE = "bot.log"
 OUTPUT_FILE = "top_stocks.csv"
-TELEGRAM_TOKEN = "8453354058:AAGG0v0zLWTe1NJE7ttfaUZvoutf5XNGU7s"  # החלף במפתח הבוט שלך מ-BotFather
-CHAT_ID = "6387878532"  # החלף במזהה הצ'אט שלך ב-Telegram
-ALPHA_VANTAGE_API_KEY = "PQT4IGSHW87JP58H"  # החלף במפתח מ-https://www.alphavantage.co
-REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"  # החלף במזהה לקוח מ-Reddit
-REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"  # החלף בסוד לקוח מ-Reddit
-REDDIT_USER_AGENT = "_bot_v1"  # החלף בשם אפליקציה (למשל, "my_bot_v1")
+TELEGRAM_TOKEN = "8453354058:AAGG0v0zLWTe1NJE7ttfaUZvoutf5XNGU7s"  # מפתח הבוט שלך
+CHAT_ID = "6387878532"  # מזהה הצ'אט שלך
+ALPHA_VANTAGE_API_KEY = "PQT4IGSHW87JP58H"  # מפתח Alpha Vantage
+REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"  # מזהה לקוח Reddit
+REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"  # סוד לקוח Reddit
+REDDIT_USER_AGENT = "_bot_v1"  # שם אפליקציה Reddit
 GAIN_THRESHOLD = 0.05
 RSI_COLD_THRESHOLD = 30
 VOLUME_THRESHOLD = 1_000_000
@@ -120,34 +121,38 @@ async def fetch_tickers():
     async with aiohttp.ClientSession(headers=headers) as session:
         # Yahoo Finance API (yfinance)
         try:
-            exchanges = ['^IXIC', '^NYA']
-            for exchange in exchanges:
-                tickers_data = yf.Tickers(exchange)
-                for ticker in tickers_data.tickers:
-                    try:
-                        info = ticker.info
-                        if (info.get('regularMarketPrice', 0) <= 5.0 and
-                            info.get('regularMarketVolume', 0) >= VOLUME_THRESHOLD and
-                            info.get('exchange') in ['NAS', 'NYQ']):
-                            tickers.append(ticker.ticker)
-                    except Exception as e:
-                        log_error(f"Yahoo Finance ticker {ticker.ticker} error: {e}")
+            tickers_data = yf.Tickers(' '.join(['^IXIC', '^NYA']))
+            for ticker in tickers_data.tickers:
+                try:
+                    info = ticker.info
+                    price = info.get('regularMarketPrice', 0)
+                    volume = info.get('regularMarketVolume', 0)
+                    exchange = info.get('exchange', '')
+                    if price <= 5.0 and volume >= VOLUME_THRESHOLD and exchange in ['NAS', 'NYQ']:
+                        tickers.append(ticker.ticker)
+                except Exception as e:
+                    log_error(f"Yahoo Finance ticker {ticker.ticker} error: {e}")
             tickers = list(set(tickers))[:MAX_TICKERS]
+            logging.info(f"Fetched {len(tickers)} tickers from Yahoo Finance")
         except Exception as e:
             log_error(f"Yahoo Finance fetch error: {e}")
 
         # Alpha Vantage API
-        if len(tickers) < MAX_TICKERS and ALPHA_VANTAGE_API_KEY != "YOUR_ALPHA_VANTAGE_API_KEY":
+        if len(tickers) < MAX_TICKERS:
             try:
                 url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={ALPHA_VANTAGE_API_KEY}"
                 async with session.get(url, timeout=10) as response:
-                    if response.status == 200:
-                        data = pd.read_csv(await response.text())
-                        data = data[(data['price'] <= 5.0) & 
-                                   (data['volume'] >= VOLUME_THRESHOLD) & 
-                                   (data['exchange'].isin(['NASDAQ', 'NYSE']))]
-                        tickers.extend(data['symbol'].tolist())
-                        tickers = list(set(tickers))[:MAX_TICKERS]
+                    response.raise_for_status()
+                    text = await response.text()
+                    # Process CSV from string
+                    csv_data = StringIO(text)
+                    data = pd.read_csv(csv_data)
+                    data = data[(data['status'] == 'Active') & 
+                               (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
+                               (data['assetType'] == 'Stock')]
+                    tickers.extend(data['symbol'].tolist())
+                    tickers = list(set(tickers))[:MAX_TICKERS]
+                    logging.info(f"Fetched {len(tickers)} tickers from Alpha Vantage")
             except Exception as e:
                 log_error(f"Alpha Vantage fetch error: {e}")
 
@@ -156,14 +161,15 @@ async def fetch_tickers():
             try:
                 fallback_tickers = [
                     'AACB', 'AACG', 'AACI', 'AACT', 'AAM', 'AAME', 'AAMI', 'AAOI', 'AARD', 'AAT',
-                    'AAUC', 'ABAT', 'ABCL', 'ABEO', 'ABL', 'ABLV', 'ABOS', 'ABP', 'ABSI', 'ABTS'
+                    'AAUC', 'ABAT', 'ABCL', 'ABEO', 'ABL', 'ABLV', 'ABOS', 'ABSI', 'ABTS', 'AC'
                 ]
                 tickers.extend([t for t in fallback_tickers if t not in tickers])
                 tickers = list(set(tickers))[:MAX_TICKERS]
+                logging.info(f"Added {len(tickers)} fallback tickers from Finviz")
             except Exception as e:
                 log_error(f"Fallback Finviz document error: {e}")
 
-    logging.info(f"Fetched {len(tickers)} tickers")
+    logging.info(f"Total fetched {len(tickers)} tickers")
     return tickers
 
 # ============================== #
@@ -243,7 +249,7 @@ def prepare_features(df, info, vix_data=None):
     df['ma_50'] = df['Close'].rolling(50).mean()
     df['rsi'] = calculate_rsi(df['Close'])
     df['atr'] = calculate_atr(df)
-    df['short_interest'] = info.get('shortInterestRatio', 0)
+    df['short_interest'] = info.get('shortPercentOfFloat', 0)
     df['float'] = info.get('floatShares', 0)
     df['vix'] = vix_data['Close'].iloc[-1] if vix_data is not None else 0
     df = df.dropna()
@@ -328,10 +334,10 @@ async def analyze_ticker(ticker):
         score = min(1.0, 0.4 * (RSI_COLD_THRESHOLD - rsi) / RSI_COLD_THRESHOLD +
                     0.3 * (1 - atr / last_close) + 0.2 * (last_close / ma_50) +
                     0.05 * google_trend + 0.05 * reddit_sentiment +
-                    0.1 * (info.get('shortInterestRatio', 0) / 100))
+                    0.1 * (info.get('shortPercentOfFloat', 0) / 100))
 
         days_in_trade = max(3, min(14, int(10 / max(atr / last_close, 0.01))))
-        win_prob = 0.6 + 0.1 * (info.get('shortInterestRatio', 0) > 20) + 0.1 * (rsi < 20)
+        win_prob = 0.6 + 0.1 * (info.get('shortPercentOfFloat', 0) > 20) + 0.1 * (rsi < 20)
         position_size = kelly_criterion(win_prob=win_prob)
 
         return {
@@ -345,7 +351,7 @@ async def analyze_ticker(ticker):
             "position_size": position_size,
             "google_trend": google_trend,
             "reddit_sentiment": reddit_sentiment,
-            "short_interest": info.get('shortInterestRatio', 0),
+            "short_interest": info.get('shortPercentOfFloat', 0),
             "feature_importance": importance_str
         }
     except Exception as e:
