@@ -34,12 +34,12 @@ REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"  # מזהה לקוח Reddit
 REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"  # סוד לקוח Reddit
 REDDIT_USER_AGENT = "_bot_v1"  # שם אפליקציה Reddit
 GAIN_THRESHOLD = 0.05
-RSI_COLD_THRESHOLD = 30
-VOLUME_THRESHOLD = 1_000_000
+RSI_COLD_THRESHOLD = 40  # הקלה מ-30 ל-40 כדי למצוא יותר מניות
+VOLUME_THRESHOLD = 500_000  # הקלה מ-1M ל-500K כדי למצוא יותר מניות
 MARKET_CAP_THRESHOLD = 50_000_000
 FLOAT_THRESHOLD = 50_000_000
 MAX_API_RETRIES = 3
-RETRY_DELAY = 5
+RETRY_DELAY = 10
 MAX_TICKERS = 50
 RATE_LIMIT_PER_MINUTE = 60
 
@@ -121,17 +121,19 @@ async def fetch_tickers():
     async with aiohttp.ClientSession(headers=headers) as session:
         # Yahoo Finance API (yfinance)
         try:
-            tickers_data = yf.Tickers(' '.join(['^IXIC', '^NYA']))
-            for ticker in tickers_data.tickers:
-                try:
-                    info = ticker.info
-                    price = info.get('regularMarketPrice', 0)
-                    volume = info.get('regularMarketVolume', 0)
-                    exchange = info.get('exchange', '')
-                    if price <= 5.0 and volume >= VOLUME_THRESHOLD and exchange in ['NAS', 'NYQ']:
-                        tickers.append(ticker.ticker)
-                except Exception as e:
-                    log_error(f"Yahoo Finance ticker {ticker.ticker} error: {e}")
+            exchanges = ['^IXIC', '^NYA']
+            for exchange in exchanges:
+                tickers_data = yf.Tickers(exchange)
+                for ticker_symbol in tickers_data.tickers:
+                    try:
+                        ticker = tickers_data.tickers[ticker_symbol]
+                        info = ticker.info
+                        if (info.get('regularMarketPrice', 0) <= 5.0 and
+                            info.get('regularMarketVolume', 0) >= VOLUME_THRESHOLD and
+                            info.get('exchange') in ['NAS', 'NYQ']):
+                            tickers.append(ticker_symbol)
+                    except Exception as e:
+                        log_error(f"Yahoo Finance ticker {ticker_symbol} error: {e}")
             tickers = list(set(tickers))[:MAX_TICKERS]
             logging.info(f"Fetched {len(tickers)} tickers from Yahoo Finance")
         except Exception as e:
@@ -142,17 +144,17 @@ async def fetch_tickers():
             try:
                 url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={ALPHA_VANTAGE_API_KEY}"
                 async with session.get(url, timeout=10) as response:
-                    response.raise_for_status()
-                    text = await response.text()
-                    # Process CSV from string
-                    csv_data = StringIO(text)
-                    data = pd.read_csv(csv_data)
-                    data = data[(data['status'] == 'Active') & 
-                               (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
-                               (data['assetType'] == 'Stock')]
-                    tickers.extend(data['symbol'].tolist())
-                    tickers = list(set(tickers))[:MAX_TICKERS]
-                    logging.info(f"Fetched {len(tickers)} tickers from Alpha Vantage")
+                    if response.status == 200:
+                        text = await response.text()
+                        # Process CSV from string
+                        csv_data = StringIO(text)
+                        data = pd.read_csv(csv_data)
+                        data = data[(data['status'] == 'Active') & 
+                                   (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
+                                   (data['assetType'] == 'Stock')]
+                        tickers.extend(data['symbol'].tolist())
+                        tickers = list(set(tickers))[:MAX_TICKERS]
+                        logging.info(f"Fetched {len(tickers)} tickers from Alpha Vantage")
             except Exception as e:
                 log_error(f"Alpha Vantage fetch error: {e}")
 
@@ -161,7 +163,7 @@ async def fetch_tickers():
             try:
                 fallback_tickers = [
                     'AACB', 'AACG', 'AACI', 'AACT', 'AAM', 'AAME', 'AAMI', 'AAOI', 'AARD', 'AAT',
-                    'AAUC', 'ABAT', 'ABCL', 'ABEO', 'ABL', 'ABLV', 'ABOS', 'ABSI', 'ABTS', 'AC'
+                    'AAUC', 'ABAT', 'ABCL', 'ABEO', 'ABL', 'ABLV', 'ABOS', 'ABP', 'ABSI', 'ABTS'
                 ]
                 tickers.extend([t for t in fallback_tickers if t not in tickers])
                 tickers = list(set(tickers))[:MAX_TICKERS]
@@ -209,7 +211,7 @@ async def get_google_trends(ticker):
     for attempt in range(MAX_API_RETRIES):
         try:
             pytrends = TrendReq(hl='en-US', tz=360)
-            pytrends.build_payload([ticker], timeframe='now 7-d')
+            pytrens.build_payload([ticker], timeframe='now 7-d')
             data = pytrends.interest_over_time()
             if not data.empty:
                 return data[ticker].mean() / 100
