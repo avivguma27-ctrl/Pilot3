@@ -34,12 +34,12 @@ REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"  # מזהה לקוח Reddit
 REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"  # סוד לקוח Reddit
 REDDIT_USER_AGENT = "_bot_v1"  # שם אפליקציה Reddit
 GAIN_THRESHOLD = 0.05
-RSI_COLD_THRESHOLD = 40  # הקלה מ-30 ל-40 כדי למצוא יותר מניות
-VOLUME_THRESHOLD = 500_000  # הקלה מ-1M ל-500K כדי למצוא יותר מניות
+RSI_COLD_THRESHOLD = 40  # הקלה מ-30 ל-40
+VOLUME_THRESHOLD = 500_000  # הקלה מ-1M ל-500K
 MARKET_CAP_THRESHOLD = 50_000_000
 FLOAT_THRESHOLD = 50_000_000
 MAX_API_RETRIES = 3
-RETRY_DELAY = 10
+RETRY_DELAY = 15  # הגדלה ל-15 שניות למגבלות API
 MAX_TICKERS = 50
 RATE_LIMIT_PER_MINUTE = 60
 
@@ -144,17 +144,17 @@ async def fetch_tickers():
             try:
                 url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={ALPHA_VANTAGE_API_KEY}"
                 async with session.get(url, timeout=10) as response:
-                    if response.status == 200:
-                        text = await response.text()
-                        # Process CSV from string
-                        csv_data = StringIO(text)
-                        data = pd.read_csv(csv_data)
-                        data = data[(data['status'] == 'Active') & 
-                                   (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
-                                   (data['assetType'] == 'Stock')]
-                        tickers.extend(data['symbol'].tolist())
-                        tickers = list(set(tickers))[:MAX_TICKERS]
-                        logging.info(f"Fetched {len(tickers)} tickers from Alpha Vantage")
+                    response.raise_for_status()
+                    text = await response.text()
+                    # Process CSV from string
+                    csv_data = StringIO(text)
+                    data = pd.read_csv(csv_data)
+                    data = data[(data['status'] == 'Active') & 
+                               (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
+                               (data['assetType'] == 'Stock')]
+                    tickers.extend(data['symbol'].tolist())
+                    tickers = list(set(tickers))[:MAX_TICKERS]
+                    logging.info(f"Fetched {len(tickers)} tickers from Alpha Vantage")
             except Exception as e:
                 log_error(f"Alpha Vantage fetch error: {e}")
 
@@ -210,9 +210,9 @@ async def get_google_trends(ticker):
     """Fetch Google Trends data with retry logic."""
     for attempt in range(MAX_API_RETRIES):
         try:
-            pytrends = TrendReq(hl='en-US', tz=360)
+            pytrens = TrendReq(hl='en-US', tz=360)
             pytrens.build_payload([ticker], timeframe='now 7-d')
-            data = pytrends.interest_over_time()
+            data = pytrens.interest_over_time()
             if not data.empty:
                 return data[ticker].mean() / 100
         except Exception as e:
