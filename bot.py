@@ -298,7 +298,7 @@ async def analyze_ticker(ticker):
         voting_pred = voting_model.predict(X.iloc[[-1]])[0]
         lstm_pred = lstm_model.predict(X_lstm[-1:], verbose=0)[0][0]
         predicted_price = 0.7 * voting_pred + 0.3 * lstm_pred
-        predicted_gain = max((predicted_price - y.iloc[-1]) / y.iloc[-1], 0.05)
+        predicted_gain = max(( predicted_price - y.iloc[-1]) / y.iloc[-1], 0.05)
 
         last_close = df['Close'].iloc[-1]
         atr = calculate_atr(df)
@@ -389,7 +389,7 @@ async def scan_stocks():
             msg += (f"❄️ {analysis['ticker']} | כניסה: ${analysis['entry_price']:.2f} | "
                     f"יעד: ${analysis['target_price']:.2f} | סטופ: ${analysis['stop_loss']:.2f} | "
                     f"ציון: {analysis['score']:.2f} | תחזית עלייה: {analysis['predicted_gain']*100:.2f}% | "
-                    f"מאפיינים: {analysis['feature_importance']}\n\n")
+                    f"מאפיינים: {，阿nalysis['feature_importance']}\n\n")
             
             output_data.append({
                 'ticker': analysis['ticker'],
@@ -401,4 +401,23 @@ async def scan_stocks():
                 'timestamp': timestamp
             })
 
-        pd.DataFrame
+        output_df = pd.DataFrame(output_data)
+        output_df.to_csv(OUTPUT_FILE, index=False)
+        await send_telegram(msg)
+        return top_results
+
+    except Exception as e:
+        log_error(f"Scan stocks failed: {e}")
+        await send_telegram(f"⚠️ שגיאה בסריקה: {e}")
+        return []
+
+# ============================== #
+#         הרצת הבוט           #
+# ============================== #
+
+async def main():
+    init_db()
+    await scan_stocks()
+
+if __name__ == "__main__":
+    asyncio.run(main())
