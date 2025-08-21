@@ -5,7 +5,6 @@ import numpy as np
 import sqlite3
 import telegram
 import logging
-import yfinance as yf
 from datetime import datetime
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor, VotingRegressor
 from sklearn.model_selection import TimeSeriesSplit
@@ -17,7 +16,6 @@ from transformers import pipeline
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 import warnings
-from io import StringIO
 warnings.filterwarnings('ignore', category=FutureWarning)
 
 # ============================== #
@@ -29,7 +27,7 @@ LOG_FILE = "bot.log"
 OUTPUT_FILE = "top_stocks.csv"
 TELEGRAM_TOKEN = "8453354058:AAGG0v0zLWTe1NJE7ttfaUZvoutf5XNGU7s"
 CHAT_ID = "6387878532"
-ALPHA_VANTAGE_API_KEY = "PQT4IGSHW87JP58H"
+FMP_API_KEY = "5nhxZGIiFnjG8JxcdSKljx0eZRuqwELX"  # מפתח ה-API של FMP
 REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"
 REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"
 REDDIT_USER_AGENT = "_bot_v1"
@@ -107,17 +105,21 @@ async def send_telegram(msg):
     await send_telegram(f"⚠️ שגיאה: לא הצלחתי לשלוח התראה, בדוק את {LOG_FILE}")
 
 # ============================== #
-#         בדיקת Yahoo Finance     #
+#         בדיקת FMP API           #
 # ============================== #
 
-async def check_yahoo_finance():
+async def check_fmp_api():
     try:
-        df = yf.download("AAPL", period="1d", interval="1d", progress=False)
-        if df.empty:
-            raise Exception("Yahoo Finance returned empty data for AAPL")
-        return True
+        async with aiohttp.ClientSession() as session:
+            url = f"https://financialmodelingprep.com/api/v3/quote/AAPL?apikey={FMP_API_KEY}"
+            async with session.get(url, timeout=10) as response:
+                response.raise_for_status()
+                data = await response.json()
+                if not data or len(data) == 0:
+                    raise Exception("FMP API returned empty data for AAPL")
+                return True
     except Exception as e:
-        log_error(f"Yahoo Finance check failed: {e}")
+        log_error(f"FMP API check failed: {e}")
         return False
 
 # ============================== #
@@ -128,10 +130,10 @@ async def fetch_tickers():
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0'}
     async with aiohttp.ClientSession(headers=headers) as session:
-        if not await check_yahoo_finance():
-            log_error("Yahoo Finance is down, falling back to Alpha Vantage")
-        else:
+        if not await check_fmp_api():
+            log_error("FMP API is down, falling back to Yahoo Finance")
             try:
+                import yfinance as yf
                 exchanges = ['^IXIC', '^NYA']
                 for exchange in exchanges:
                     tickers_data = yf.Tickers(exchange)
@@ -153,46 +155,42 @@ async def fetch_tickers():
                     tickers = list(set(tickers))[:MAX_TICKERS]
             except Exception as e:
                 log_error(f"Yahoo Finance fetch error: {e}")
-
-        if len(tickers) < MAX_TICKERS:
+        else:
             try:
-                url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={ALPHA_VANTAGE_API_KEY}"
+                # משיכת רשימת טיקרים פעילים מ-FMP
+                url = f"https://financialmodelingprep.com/api/v3/stock/list?apikey={FMP_API_KEY}"
                 async with session.get(url, timeout=10) as response:
                     response.raise_for_status()
-                    text = await response.text()
-                    csv_data = StringIO(text)
-                    data = pd.read_csv(csv_data)
-                    # המר את עמודת symbol למחרוזת וטפל בערכים חסרים
-                    data['symbol'] = data['symbol'].astype(str).fillna('')
-                    data = data[
-                        (data['status'] == 'Active') & 
-                        (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
-                        (data['assetType'] == 'Stock') &
-                        (~data['symbol'].str.contains('-WS|-U|-R|-P-', na=False))
+                    data = await response.json()
+                    df = pd.DataFrame(data)
+                    df['symbol'] = df['symbol'].astype(str).fillna('')
+                    df = df[
+                        (df['price'] <= 5.0) &
+                        (df['volume'] >= VOLUME_THRESHOLD) &
+                        (df['exchangeShortName'].isin(['NASDAQ', 'NYSE'])) &
+                        (~df['symbol'].str.contains('-WS|-U|-R|-P-', na=False))
                     ]
-                    for ticker_symbol in data['symbol'].tolist():
-                        try:
-                            df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
-                            if not df.empty:
-                                tickers.append(ticker_symbol)
-                            await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
-                        except Exception as e:
-                            log_error(f"Alpha Vantage ticker {ticker_symbol} error: {e}")
-                    tickers = list(set(tickers))[:MAX_TICKERS]
+                    tickers = df['symbol'].tolist()[:MAX_TICKERS]
+                    logging.info(f"Fetched {len(tickers)} tickers from FMP")
             except Exception as e:
-                log_error(f"Alpha Vantage fetch error: {e}")
+                log_error(f"FMP fetch error: {e}")
 
         if len(tickers) < 5:
             try:
-                # רשימת טיקרים חלופית מעודכנת ללא ABIO
+                # רשימת טיקרים חלופית מעודכנת
                 fallback_tickers = ['AACG', 'AAOI', 'AAME', 'AATC', 'ABAT', 'ABCB', 'ABSI', 'ABVC', 'ACAD', 'ACET']
                 for ticker_symbol in fallback_tickers:
                     if any(suffix in ticker_symbol for suffix in ['-WS', '-U', '-R', '-P-']):
                         continue
                     try:
-                        df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
-                        if not df.empty and ticker_symbol not in tickers:
-                            tickers.append(ticker_symbol)
+                        async with session.get(
+                            f"https://financialmodelingprep.com/api/v3/quote/{ticker_symbol}?apikey={FMP_API_KEY}",
+                            timeout=10
+                        ) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            if data and len(data) > 0 and ticker_symbol not in tickers:
+                                tickers.append(ticker_symbol)
                         await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
                     except Exception as e:
                         log_error(f"Fallback ticker {ticker_symbol} error: {e}")
@@ -299,8 +297,7 @@ async def analyze_ticker(ticker):
         log_error(f"Invalid ticker: {ticker}")
         return None
     try:
-        async with aiohttp.ClientSession() as session:  # פתיחת סשן מקומי
-            # השתמש ב-wait_for במקום timeout
+        async with aiohttp.ClientSession() as session:
             result = await asyncio.wait_for(analyze_ticker_inner(ticker, session), timeout=30)
             return result
     except asyncio.TimeoutError:
@@ -312,14 +309,33 @@ async def analyze_ticker(ticker):
 
 async def analyze_ticker_inner(ticker, session):
     try:
-        ticker_obj = yf.Ticker(ticker)
-        info = ticker_obj.info
-        df = ticker_obj.history(period="1y", interval="1d")
-        if df.empty or len(df) < 50:
-            log_error(f"No sufficient data for {ticker} - Data shape: {df.shape if not df.empty else 'empty'}")
-            return None
+        # משיכת נתונים היסטוריים מ-FMP
+        url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?timeseries=252&apikey={FMP_API_KEY}"
+        async with session.get(url, timeout=10) as response:
+            response.raise_for_status()
+            data = await response.json()
+            if not data.get('historical'):
+                log_error(f"No historical data for {ticker}")
+                return None
+            df = pd.DataFrame(data['historical'])
+            df = df.rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+            df['Date'] = pd.to_datetime(df['Date'])
+            df = df.set_index('Date').sort_index()
+            if len(df) < 50:
+                log_error(f"Insufficient data for {ticker} - Data shape: {df.shape}")
+                return None
 
+        # משיכת נתונים פונדמנטליים
+        url_info = f"https://financialmodelingprep.com/api/v3/profile/{ticker}?apikey={FMP_API_KEY}"
+        async with session.get(url_info, timeout=10) as response:
+            response.raise_for_status()
+            info_data = await response.json()
+            info = info_data[0] if info_data else {}
+
+        # משיכת נתוני VIX
+        import yfinance as yf
         vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
+
         google_trend = await get_google_trends(ticker)
         reddit_sentiment = await analyze_reddit_sentiment(ticker)
 
