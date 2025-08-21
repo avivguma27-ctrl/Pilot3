@@ -40,7 +40,7 @@ MARKET_CAP_THRESHOLD = 50_000_000
 FLOAT_THRESHOLD = 50_000_000
 MAX_API_RETRIES = 3
 RETRY_DELAY = 15
-MAX_TICKERS = 10  # הופחת ל-10 לבדיקה
+MAX_TICKERS = 10
 RATE_LIMIT_PER_MINUTE = 60
 
 logging.basicConfig(
@@ -162,11 +162,13 @@ async def fetch_tickers():
                     text = await response.text()
                     csv_data = StringIO(text)
                     data = pd.read_csv(csv_data)
+                    # המר את עמודת symbol למחרוזת וטפל בערכים חסרים
+                    data['symbol'] = data['symbol'].astype(str).fillna('')
                     data = data[
                         (data['status'] == 'Active') & 
                         (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
                         (data['assetType'] == 'Stock') &
-                        (~data['symbol'].str.contains('-WS|-U|-R|-P-'))
+                        (~data['symbol'].str.contains('-WS|-U|-R|-P-', na=False))
                     ]
                     for ticker_symbol in data['symbol'].tolist():
                         try:
@@ -182,7 +184,8 @@ async def fetch_tickers():
 
         if len(tickers) < 5:
             try:
-                fallback_tickers = ['AACG', 'AAOI', 'AAME', 'AATC', 'ABAT', 'ABCB', 'ABIO', 'ABSI', 'ABVC', 'ACAD']
+                # רשימת טיקרים חלופית מעודכנת ללא ABIO
+                fallback_tickers = ['AACG', 'AAOI', 'AAME', 'AATC', 'ABAT', 'ABCB', 'ABSI', 'ABVC', 'ACAD', 'ACET']
                 for ticker_symbol in fallback_tickers:
                     if any(suffix in ticker_symbol for suffix in ['-WS', '-U', '-R', '-P-']):
                         continue
@@ -296,75 +299,84 @@ async def analyze_ticker(ticker):
         log_error(f"Invalid ticker: {ticker}")
         return None
     try:
-        async with asyncio.timeout(30):  # מגבלת זמן של 30 שניות
-            ticker_obj = yf.Ticker(ticker)
-            info = ticker_obj.info
-            df = ticker_obj.history(period="1y", interval="1d")
-            if df.empty or len(df) < 50:
-                log_error(f"No sufficient data for {ticker}")
-                return None
-
-            vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
-            google_trend = await get_google_trends(ticker)
-            reddit_sentiment = await analyze_reddit_sentiment(ticker)
-
-            df_features = prepare_features(df, info, vix_data)
-            if df_features.empty:
-                log_error(f"No features for {ticker}")
-                return None
-
-            X = df_features.drop(columns=['Close'])
-            y = df_features['Close']
-            tscv = TimeSeriesSplit(n_splits=5)
-            voting_model = VotingRegressor([
-                ('rf', RandomForestRegressor(n_estimators=100, random_state=42)),
-                ('gb', GradientBoostingRegressor(n_estimators=100, random_state=42)),
-                ('xgb', xgb.XGBRegressor(n_estimators=100, random_state=42))
-            ])
-
-            mse_scores = []
-            for train_index, test_index in tscv.split(X):
-                X_train, X_test = X.iloc[train_index], X.iloc[test_index]
-                y_train, y_test = y.iloc[train_index], y.iloc[test_index]
-                voting_model.fit(X_train, y_train)
-                y_pred = voting_model.predict(X_test)
-                mse_scores.append(mean_squared_error(y_test, y_pred))
-
-            # LSTM
-            X_lstm = X.values.reshape((X.shape[0], 1, X.shape[1]))
-            lstm_model = build_lstm_model((1, X.shape[1]))
-            lstm_model.fit(X_lstm[:-1], y.values[1:], epochs=5, batch_size=32, verbose=0)
-
-            voting_pred = voting_model.predict(X.iloc[[-1]])[0]
-            lstm_pred = lstm_model.predict(X_lstm[-1:], verbose=0)[0][0]
-            predicted_price = 0.7 * voting_pred + 0.3 * lstm_pred
-            current_price = df['Close'].iloc[-1]
-            predicted_gain = (predicted_price - current_price) / current_price
-
-            atr = calculate_atr(df)
-            target_price = current_price + atr
-            stop_loss = current_price - atr
-            position_size = kelly_criterion()
-
-            return {
-                'ticker': ticker,
-                'current_price': current_price,
-                'predicted_price': predicted_price,
-                'predicted_gain': predicted_gain,
-                'target_price': target_price,
-                'stop_loss': stop_loss,
-                'score': np.mean(mse_scores) ** -0.5,
-                'position_size': position_size,
-                'google_trend': google_trend,
-                'reddit_sentiment': reddit_sentiment,
-                'short_interest': info.get('shortPercentOfFloat', 0),
-                'feature_importance': str(voting_model.estimators_[0].feature_importances_)
-            }
+        async with aiohttp.ClientSession() as session:  # פתיחת סשן מקומי
+            # השתמש ב-wait_for במקום timeout
+            result = await asyncio.wait_for(analyze_ticker_inner(ticker, session), timeout=30)
+            return result
     except asyncio.TimeoutError:
         log_error(f"Timeout analyzing ticker {ticker}")
         return None
     except Exception as e:
-        log_error(f"Analyze ticker {ticker} failed: {str(e)} - Data shape: {df.shape if 'df' in locals() and not df.empty else 'empty'}")
+        log_error(f"Analyze ticker {ticker} failed: {str(e)}")
+        return None
+
+async def analyze_ticker_inner(ticker, session):
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        info = ticker_obj.info
+        df = ticker_obj.history(period="1y", interval="1d")
+        if df.empty or len(df) < 50:
+            log_error(f"No sufficient data for {ticker} - Data shape: {df.shape if not df.empty else 'empty'}")
+            return None
+
+        vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
+        google_trend = await get_google_trends(ticker)
+        reddit_sentiment = await analyze_reddit_sentiment(ticker)
+
+        df_features = prepare_features(df, info, vix_data)
+        if df_features.empty:
+            log_error(f"No features for {ticker}")
+            return None
+
+        X = df_features.drop(columns=['Close'])
+        y = df_features['Close']
+        tscv = TimeSeriesSplit(n_splits=5)
+        voting_model = VotingRegressor([
+            ('rf', RandomForestRegressor(n_estimators=100, random_state=42)),
+            ('gb', GradientBoostingRegressor(n_estimators=100, random_state=42)),
+            ('xgb', xgb.XGBRegressor(n_estimators=100, random_state=42))
+        ])
+
+        mse_scores = []
+        for train_index, test_index in tscv.split(X):
+            X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+            y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+            voting_model.fit(X_train, y_train)
+            y_pred = voting_model.predict(X_test)
+            mse_scores.append(mean_squared_error(y_test, y_pred))
+
+        # LSTM
+        X_lstm = X.values.reshape((X.shape[0], 1, X.shape[1]))
+        lstm_model = build_lstm_model((1, X.shape[1]))
+        lstm_model.fit(X_lstm[:-1], y.values[1:], epochs=5, batch_size=32, verbose=0)
+
+        voting_pred = voting_model.predict(X.iloc[[-1]])[0]
+        lstm_pred = lstm_model.predict(X_lstm[-1:], verbose=0)[0][0]
+        predicted_price = 0.7 * voting_pred + 0.3 * lstm_pred
+        current_price = df['Close'].iloc[-1]
+        predicted_gain = (predicted_price - current_price) / current_price
+
+        atr = calculate_atr(df)
+        target_price = current_price + atr
+        stop_loss = current_price - atr
+        position_size = kelly_criterion()
+
+        return {
+            'ticker': ticker,
+            'current_price': current_price,
+            'predicted_price': predicted_price,
+            'predicted_gain': predicted_gain,
+            'target_price': target_price,
+            'stop_loss': stop_loss,
+            'score': np.mean(mse_scores) ** -0.5,
+            'position_size': position_size,
+            'google_trend': google_trend,
+            'reddit_sentiment': reddit_sentiment,
+            'short_interest': info.get('shortPercentOfFloat', 0),
+            'feature_importance': str(voting_model.estimators_[0].feature_importances_)
+        }
+    except Exception as e:
+        log_error(f"Analyze ticker {ticker} inner failed: {str(e)} - Data shape: {df.shape if 'df' in locals() and not df.empty else 'empty'}")
         return None
 
 async def scan_stocks():
@@ -380,7 +392,7 @@ async def scan_stocks():
         for i, analysis in enumerate(analyses):
             logging.info(f"Processed ticker {cold_list[i]}: {'Success' if analysis and not isinstance(analysis, Exception) else 'Failed'}")
             if isinstance(analysis, Exception):
-                log_error(f"Analysis failed: {analysis}")
+                log_error(f"Analysis failed for {cold_list[i]}: {analysis}")
                 continue
             if analysis and analysis['predicted_gain'] > GAIN_THRESHOLD:
                 results.append(analysis)
