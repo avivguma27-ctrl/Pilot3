@@ -125,7 +125,10 @@ async def fetch_tickers():
                         if (info.get('regularMarketPrice', 0) <= 5.0 and
                             info.get('regularMarketVolume', 0) >= VOLUME_THRESHOLD and
                             info.get('exchange') in ['NAS', 'NYQ']):
-                            tickers.append(ticker_symbol)
+                            # בדיקה נוספת לוודא שהטיקר תקף
+                            df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
+                            if not df.empty:
+                                tickers.append(ticker_symbol)
                     except Exception as e:
                         log_error(f"Yahoo Finance ticker {ticker_symbol} error: {e}")
             tickers = list(set(tickers))[:MAX_TICKERS]
@@ -143,7 +146,13 @@ async def fetch_tickers():
                     data = data[(data['status'] == 'Active') & 
                                (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
                                (data['assetType'] == 'Stock')]
-                    tickers.extend(data['symbol'].tolist())
+                    for ticker_symbol in data['symbol'].tolist():
+                        try:
+                            df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
+                            if not df.empty:
+                                tickers.append(ticker_symbol)
+                        except Exception as e:
+                            log_error(f"Alpha Vantage ticker {ticker_symbol} error: {e}")
                     tickers = list(set(tickers))[:MAX_TICKERS]
             except Exception as e:
                 log_error(f"Alpha Vantage fetch error: {e}")
@@ -152,7 +161,13 @@ async def fetch_tickers():
             try:
                 fallback_tickers = ['AACB','AACG','AACI','AACT','AAM','AAME','AAMI','AAOI','AARD','AAT',
                                     'AAUC','ABAT','ABCL','ABEO','ABL','ABLV','ABOS','ABP','ABSI','ABTS']
-                tickers.extend([t for t in fallback_tickers if t not in tickers])
+                for ticker_symbol in fallback_tickers:
+                    try:
+                        df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
+                        if not df.empty and ticker_symbol not in tickers:
+                            tickers.append(ticker_symbol)
+                    except Exception as e:
+                        log_error(f"Fallback ticker {ticker_symbol} error: {e}")
                 tickers = list(set(tickers))[:MAX_TICKERS]
             except Exception as e:
                 log_error(f"Fallback tickers error: {e}")
@@ -238,13 +253,16 @@ def prepare_features(df, info, vix_data=None):
 
 def build_lstm_model(input_shape):
     model = Sequential()
-    model.add(LSTM(30, input_shape=input_shape))
+    model.add(LSTM(20, input_shape=input_shape))  # הקטנת מספר הנוירונים ל-20 לשיפור ביצועים ב-CPU
     model.add(Dropout(0.2))
     model.add(Dense(1))
     model.compile(optimizer='adam', loss='mse')
     return model
 
 async def analyze_ticker(ticker):
+    if not isinstance(ticker, str) or ticker.lower() == 'nan':
+        log_error(f"Invalid ticker: {ticker}")
+        return None
     try:
         ticker_obj = yf.Ticker(ticker)
         for attempt in range(MAX_API_RETRIES):
