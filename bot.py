@@ -41,6 +41,7 @@ FLOAT_THRESHOLD = 50_000_000
 MAX_API_RETRIES = 3
 RETRY_DELAY = 15
 MAX_TICKERS = 50
+RATE_LIMIT_PER_MINUTE = 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,7 +56,6 @@ bot = telegram.Bot(token=TELEGRAM_TOKEN)
 # ============================== #
 
 def init_db():
-    """Initialize SQLite database with trades and errors tables."""
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
         cursor.execute('''
@@ -87,7 +87,6 @@ def init_db():
         conn.commit()
 
 def log_error(msg):
-    """Log errors to file and database."""
     logging.error(msg)
     with sqlite3.connect(DB_FILE) as conn:
         cursor = conn.cursor()
@@ -96,7 +95,6 @@ def log_error(msg):
         conn.commit()
 
 async def send_telegram(msg):
-    """Send message via Telegram with retry logic."""
     for attempt in range(MAX_API_RETRIES):
         try:
             await bot.send_message(chat_id=CHAT_ID, text=msg)
@@ -106,18 +104,16 @@ async def send_telegram(msg):
             if attempt < MAX_API_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY)
     log_error("Failed to send Telegram message after retries")
+    await send_telegram(f"⚠️ שגיאה: לא הצלחתי לשלוח התראה, בדוק את {LOG_FILE}")
 
 # ============================== #
 #         משיכת טיקרים           #
 # ============================== #
 
 async def fetch_tickers():
-    """Fetch penny stock tickers from Yahoo Finance and Alpha Vantage."""
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0'}
-
     async with aiohttp.ClientSession(headers=headers) as session:
-        # Yahoo Finance
         try:
             exchanges = ['^IXIC', '^NYA']
             for exchange in exchanges:
@@ -133,11 +129,9 @@ async def fetch_tickers():
                     except Exception as e:
                         log_error(f"Yahoo Finance ticker {ticker_symbol} error: {e}")
             tickers = list(set(tickers))[:MAX_TICKERS]
-            logging.info(f"Fetched {len(tickers)} tickers from Yahoo Finance")
         except Exception as e:
             log_error(f"Yahoo Finance fetch error: {e}")
 
-        # Alpha Vantage fallback
         if len(tickers) < MAX_TICKERS:
             try:
                 url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={ALPHA_VANTAGE_API_KEY}"
@@ -146,18 +140,22 @@ async def fetch_tickers():
                     text = await response.text()
                     csv_data = StringIO(text)
                     data = pd.read_csv(csv_data)
-                    data = data[(data['status'] == 'Active') & (data['exchange'].isin(['NASDAQ', 'NYSE'])) & (data['assetType'] == 'Stock')]
+                    data = data[(data['status'] == 'Active') & 
+                               (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
+                               (data['assetType'] == 'Stock')]
                     tickers.extend(data['symbol'].tolist())
                     tickers = list(set(tickers))[:MAX_TICKERS]
-                    logging.info(f"Fetched {len(tickers)} tickers from Alpha Vantage")
             except Exception as e:
                 log_error(f"Alpha Vantage fetch error: {e}")
 
-        # Fallback list
         if len(tickers) < 10:
-            fallback_tickers = ['AACB', 'AACG', 'AACI', 'AACT', 'AAM', 'AAME', 'AAMI', 'AAOI', 'AARD', 'AAT']
-            tickers.extend([t for t in fallback_tickers if t not in tickers])
-            tickers = list(set(tickers))[:MAX_TICKERS]
+            try:
+                fallback_tickers = ['AACB','AACG','AACI','AACT','AAM','AAME','AAMI','AAOI','AARD','AAT',
+                                    'AAUC','ABAT','ABCL','ABEO','ABL','ABLV','ABOS','ABP','ABSI','ABTS']
+                tickers.extend([t for t in fallback_tickers if t not in tickers])
+                tickers = list(set(tickers))[:MAX_TICKERS]
+            except Exception as e:
+                log_error(f"Fallback Finviz document error: {e}")
 
     return tickers
 
@@ -169,11 +167,10 @@ def calculate_rsi(series, period=14):
     delta = series.diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(period, min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(period, min_periods=1).mean()
+    avg_gain = pd.Series(gain).rolling(window=period, min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(window=period, min_periods=1).mean()
     rs = avg_gain / (avg_loss + 1e-9)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.iloc[-1]
+    return 100 - (100 / (1 + rs)).iloc[-1]
 
 def calculate_atr(df, period=14):
     high_low = df["High"] - df["Low"]
@@ -200,13 +197,15 @@ async def get_google_trends(ticker):
             if not data.empty:
                 return data[ticker].mean() / 100
         except Exception as e:
-            log_error(f"Google Trends error {ticker} attempt {attempt + 1}: {e}")
-            await asyncio.sleep(RETRY_DELAY)
+            log_error(f"Google Trends error for {ticker} (attempt {attempt + 1}): {e}")
+            if attempt < MAX_API_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY)
     return 0
 
 async def analyze_reddit_sentiment(ticker):
     try:
-        reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
+        reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, 
+                             user_agent=REDDIT_USER_AGENT)
         sentiment_analyzer = pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english')
         sentiment = 0
         count = 0
@@ -255,8 +254,12 @@ async def analyze_ticker(ticker):
                 vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
                 break
             except Exception as e:
-                log_error(f"Yahoo Finance error for {ticker} attempt {attempt + 1}: {e}")
-                await asyncio.sleep(RETRY_DELAY)
+                log_error(f"Yahoo Finance error for {ticker} (attempt {attempt + 1}): {e}")
+                if attempt < MAX_API_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+                else:
+                    return None
+
         if df.empty or df['Volume'].iloc[-1] < VOLUME_THRESHOLD or info.get('marketCap', 0) < MARKET_CAP_THRESHOLD or info.get('floatShares', 0) > FLOAT_THRESHOLD:
             return None
 
@@ -393,4 +396,9 @@ async def scan_stocks():
                 'entry_price': analysis['entry_price'],
                 'target_price': analysis['target_price'],
                 'stop_loss': analysis['stop_loss'],
-               
+                'score': analysis['score'],
+                'predicted_gain': analysis['predicted_gain'],
+                'timestamp': timestamp
+            })
+
+        pd.DataFrame
