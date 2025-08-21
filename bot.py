@@ -155,7 +155,7 @@ async def fetch_tickers():
                 tickers.extend([t for t in fallback_tickers if t not in tickers])
                 tickers = list(set(tickers))[:MAX_TICKERS]
             except Exception as e:
-                log_error(f"Fallback Finviz document error: {e}")
+                log_error(f"Fallback tickers error: {e}")
 
     return tickers
 
@@ -298,7 +298,7 @@ async def analyze_ticker(ticker):
         voting_pred = voting_model.predict(X.iloc[[-1]])[0]
         lstm_pred = lstm_model.predict(X_lstm[-1:], verbose=0)[0][0]
         predicted_price = 0.7 * voting_pred + 0.3 * lstm_pred
-        predicted_gain = max(( predicted_price - y.iloc[-1]) / y.iloc[-1], 0.05)
+        predicted_gain = max((predicted_price - y.iloc[-1]) / y.iloc[-1], 0.05)
 
         last_close = df['Close'].iloc[-1]
         atr = calculate_atr(df)
@@ -389,7 +389,7 @@ async def scan_stocks():
             msg += (f"❄️ {analysis['ticker']} | כניסה: ${analysis['entry_price']:.2f} | "
                     f"יעד: ${analysis['target_price']:.2f} | סטופ: ${analysis['stop_loss']:.2f} | "
                     f"ציון: {analysis['score']:.2f} | תחזית עלייה: {analysis['predicted_gain']*100:.2f}% | "
-                    f"מאפיינים: {，阿nalysis['feature_importance']}\n\n")
+                    f"מאפיינים: {analysis['feature_importance']}\n\n")
             
             output_data.append({
                 'ticker': analysis['ticker'],
