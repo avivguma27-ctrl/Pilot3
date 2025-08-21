@@ -164,10 +164,14 @@ async def fetch_tickers():
                     data = await response.json()
                     df = pd.DataFrame(data)
                     df['symbol'] = df['symbol'].astype(str).fillna('')
-                    # בדיקה אם העמודה 'volume' קיימת, אחרת נשתמש ב-'avgVolume' או נדלג
-                    volume_col = 'volume' if 'volume' in df.columns else 'avgVolume' if 'avgVolume' in df.columns else None
+                    # בדיקת שדות אפשריים לנפח
+                    volume_col = None
+                    for col in ['volume', 'avgVolume', 'averageVolume']:
+                        if col in df.columns:
+                            volume_col = col
+                            break
                     if volume_col is None:
-                        log_error("No volume column found in FMP data")
+                        log_error("No volume column found in FMP data. Available columns: " + str(list(df.columns)))
                         raise Exception("No volume column found in FMP data")
                     df = df[
                         (df['price'] <= 5.0) &
@@ -263,22 +267,25 @@ async def get_google_trends(ticker):
     return 0
 
 async def analyze_reddit_sentiment(ticker):
-    try:
-        reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, 
-                             user_agent=REDDIT_USER_AGENT)
-        sentiment_analyzer = pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english')
-        sentiment = 0
-        count = 0
-        for post in reddit.subreddit("wallstreetbets+pennystocks").search(ticker, limit=5):
-            text = post.title + ' ' + (post.selftext or '')
-            result = sentiment_analyzer(text[:512])[0]
-            sentiment += result['score'] if result['label'] == 'POSITIVE' else -result['score']
-            count += 1
-            await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
-        return sentiment / count if count > 0 else 0
-    except Exception as e:
-        log_error(f"Reddit sentiment error for {ticker}: {e}")
-        return 0
+    for attempt in range(MAX_API_RETRIES):
+        try:
+            reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, 
+                                user_agent=REDDIT_USER_AGENT)
+            sentiment_analyzer = pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english')
+            sentiment = 0
+            count = 0
+            for post in reddit.subreddit("wallstreetbets+pennystocks").search(ticker, limit=5):
+                text = post.title + ' ' + (post.selftext or '')
+                result = sentiment_analyzer(text[:512])[0]
+                sentiment += result['score'] if result['label'] == 'POSITIVE' else -result['score']
+                count += 1
+                await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
+            return sentiment / count if count > 0 else 0
+        except Exception as e:
+            log_error(f"Reddit sentiment error for {ticker} (attempt {attempt + 1}): {e}")
+            if attempt < MAX_API_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY)
+    return 0
 
 # ============================== #
 #         ניתוח ML מתקדם         #
@@ -320,12 +327,26 @@ async def analyze_ticker_inner(ticker, session):
             response.raise_for_status()
             data = await response.json()
             if not data.get('historical'):
-                log_error(f"No historical data for {ticker}")
-                return None
-            df = pd.DataFrame(data['historical'])
-            df = df.rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
-            df['Date'] = pd.to_datetime(df['Date'])
-            df = df.set_index('Date').sort_index()
+                log_error(f"No historical data for {ticker} from FMP, trying Yahoo Finance")
+                # ניסיון גיבוי עם Yahoo Finance
+                try:
+                    import yfinance as yf
+                    df = yf.download(ticker, period="1y", interval="1d", progress=False)
+                    if df.empty:
+                        log_error(f"No historical data for {ticker} from Yahoo Finance")
+                        return None
+                    df = df.reset_index()
+                    df = df.rename(columns={'Date': 'Date', 'Open': 'Open', 'High': 'High', 'Low': 'Low', 'Close': 'Close', 'Volume': 'Volume'})
+                    df['Date'] = pd.to_datetime(df['Date'])
+                    df = df.set_index('Date').sort_index()
+                except Exception as e:
+                    log_error(f"Yahoo Finance fetch error for {ticker}: {e}")
+                    return None
+            else:
+                df = pd.DataFrame(data['historical'])
+                df = df.rename(columns={'date': 'Date', 'open': 'Open', 'high': 'High', 'low': 'Low', 'close': 'Close', 'volume': 'Volume'})
+                df['Date'] = pd.to_datetime(df['Date'])
+                df = df.set_index('Date').sort_index()
             if len(df) < 50:
                 log_error(f"Insufficient data for {ticker} - Data shape: {df.shape}")
                 return None
@@ -337,15 +358,22 @@ async def analyze_ticker_inner(ticker, session):
             info_data = await response.json()
             info = info_data[0] if info_data else {}
 
-        # משיכת נתוני VIX
-        try:
-            import yfinance as yf
-            vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
-            if vix_data.empty:
-                log_error(f"VIX data is empty for {ticker}")
-                vix_data = None
-        except Exception as e:
-            log_error(f"VIX fetch error for {ticker}: {e}")
+        # משיכת נתוני VIX עם ניסיונות חוזרים
+        vix_data = None
+        for attempt in range(MAX_API_RETRIES):
+            try:
+                import yfinance as yf
+                vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
+                if not vix_data.empty:
+                    break
+                log_error(f"VIX data is empty for {ticker} (attempt {attempt + 1})")
+                await asyncio.sleep(RETRY_DELAY)
+            except Exception as e:
+                log_error(f"VIX fetch error for {ticker} (attempt {attempt + 1}): {e}")
+                if attempt < MAX_API_RETRIES - 1:
+                    await asyncio.sleep(RETRY_DELAY)
+        if vix_data is None or vix_data.empty:
+            log_error(f"Failed to fetch VIX data for {ticker} after {MAX_API_RETRIES} attempts")
             vix_data = None
 
         google_trend = await get_google_trends(ticker)
@@ -373,7 +401,7 @@ async def analyze_ticker_inner(ticker, session):
             y_pred = voting_model.predict(X_test)
             mse_scores.append(mean_squared_error(y_test, y_pred))
 
-        # LSTM
+        # LSTM עם reduce_retracing
         X_lstm = X.values.reshape((X.shape[0], 1, X.shape[1]))
         lstm_model = build_lstm_model((1, X.shape[1]))
         lstm_model.fit(X_lstm[:-1], y.values[1:], epochs=5, batch_size=32, verbose=0)
