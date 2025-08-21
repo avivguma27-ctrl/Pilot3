@@ -27,7 +27,7 @@ LOG_FILE = "bot.log"
 OUTPUT_FILE = "top_stocks.csv"
 TELEGRAM_TOKEN = "8453354058:AAGG0v0zLWTe1NJE7ttfaUZvoutf5XNGU7s"
 CHAT_ID = "6387878532"
-FMP_API_KEY = "5nhxZGIiFnjG8JxcdSKljx0eZRuqwELX"  # מפתח ה-API של FMP
+FMP_API_KEY = "5nhxZGIiFnjG8JxcdSKljx0eZRuqwELX"
 REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"
 REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"
 REDDIT_USER_AGENT = "_bot_v1"
@@ -164,9 +164,14 @@ async def fetch_tickers():
                     data = await response.json()
                     df = pd.DataFrame(data)
                     df['symbol'] = df['symbol'].astype(str).fillna('')
+                    # בדיקה אם העמודה 'volume' קיימת, אחרת נשתמש ב-'avgVolume' או נדלג
+                    volume_col = 'volume' if 'volume' in df.columns else 'avgVolume' if 'avgVolume' in df.columns else None
+                    if volume_col is None:
+                        log_error("No volume column found in FMP data")
+                        raise Exception("No volume column found in FMP data")
                     df = df[
                         (df['price'] <= 5.0) &
-                        (df['volume'] >= VOLUME_THRESHOLD) &
+                        (df[volume_col] >= VOLUME_THRESHOLD) &
                         (df['exchangeShortName'].isin(['NASDAQ', 'NYSE'])) &
                         (~df['symbol'].str.contains('-WS|-U|-R|-P-', na=False))
                     ]
@@ -288,7 +293,7 @@ def prepare_features(df, info, vix_data=None):
     df['atr'] = calculate_atr(df)
     df['short_interest'] = info.get('shortPercentOfFloat', 0)
     df['float'] = info.get('floatShares', 0)
-    df['vix'] = vix_data['Close'].iloc[-1] if vix_data is not None else 0
+    df['vix'] = vix_data['Close'].iloc[-1] if vix_data is not None and not vix_data.empty else 0
     df = df.dropna()
     return df[['Close', 'ma_10', 'ma_50', 'rsi', 'atr', 'returns', 'short_interest', 'float', 'vix']]
 
@@ -333,8 +338,15 @@ async def analyze_ticker_inner(ticker, session):
             info = info_data[0] if info_data else {}
 
         # משיכת נתוני VIX
-        import yfinance as yf
-        vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
+        try:
+            import yfinance as yf
+            vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
+            if vix_data.empty:
+                log_error(f"VIX data is empty for {ticker}")
+                vix_data = None
+        except Exception as e:
+            log_error(f"VIX fetch error for {ticker}: {e}")
+            vix_data = None
 
         google_trend = await get_google_trends(ticker)
         reddit_sentiment = await analyze_reddit_sentiment(ticker)
