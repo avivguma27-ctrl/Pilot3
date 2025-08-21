@@ -27,21 +27,20 @@ warnings.filterwarnings('ignore', category=FutureWarning)
 DB_FILE = "penny_stocks.db"
 LOG_FILE = "bot.log"
 OUTPUT_FILE = "top_stocks.csv"
-TELEGRAM_TOKEN = "8453354058:AAGG0v0zLWTe1NJE7ttfaUZvoutf5XNGU7s"  # מפתח הבוט שלך
-CHAT_ID = "6387878532"  # מזהה הצ'אט שלך
-ALPHA_VANTAGE_API_KEY = "PQT4IGSHW87JP58H"  # מפתח Alpha Vantage
-REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"  # מזהה לקוח Reddit
-REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"  # סוד לקוח Reddit
-REDDIT_USER_AGENT = "_bot_v1"  # שם אפליקציה Reddit
+TELEGRAM_TOKEN = "8453354058:AAGG0v0zLWTe1NJE7ttfaUZvoutf5XNGU7s"
+CHAT_ID = "6387878532"
+ALPHA_VANTAGE_API_KEY = "PQT4IGSHW87JP58H"
+REDDIT_CLIENT_ID = "ZOa0YjqoW-H_-aFXhIXrLw"
+REDDIT_CLIENT_SECRET = "7v6s4PJr2kdbvtfNDq7khltKXVkCrw"
+REDDIT_USER_AGENT = "_bot_v1"
 GAIN_THRESHOLD = 0.05
-RSI_COLD_THRESHOLD = 40  # הקלה מ-30 ל-40
-VOLUME_THRESHOLD = 500_000  # הקלה מ-1M ל-500K
+RSI_COLD_THRESHOLD = 40
+VOLUME_THRESHOLD = 500_000
 MARKET_CAP_THRESHOLD = 50_000_000
 FLOAT_THRESHOLD = 50_000_000
 MAX_API_RETRIES = 3
-RETRY_DELAY = 15  # הגדלה ל-15 שניות למגבלות API
+RETRY_DELAY = 15
 MAX_TICKERS = 50
-RATE_LIMIT_PER_MINUTE = 60
 
 logging.basicConfig(
     level=logging.INFO,
@@ -107,19 +106,18 @@ async def send_telegram(msg):
             if attempt < MAX_API_RETRIES - 1:
                 await asyncio.sleep(RETRY_DELAY)
     log_error("Failed to send Telegram message after retries")
-    await send_telegram(f"⚠️ שגיאה: לא הצלחתי לשלוח התראה, בדוק את {LOG_FILE}")
 
 # ============================== #
 #         משיכת טיקרים           #
 # ============================== #
 
 async def fetch_tickers():
-    """Fetch penny stock tickers from Yahoo Finance and Alpha Vantage with fallback to Finviz document."""
+    """Fetch penny stock tickers from Yahoo Finance and Alpha Vantage."""
     tickers = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    headers = {'User-Agent': 'Mozilla/5.0'}
 
     async with aiohttp.ClientSession(headers=headers) as session:
-        # Yahoo Finance API (yfinance)
+        # Yahoo Finance
         try:
             exchanges = ['^IXIC', '^NYA']
             for exchange in exchanges:
@@ -139,39 +137,28 @@ async def fetch_tickers():
         except Exception as e:
             log_error(f"Yahoo Finance fetch error: {e}")
 
-        # Alpha Vantage API
+        # Alpha Vantage fallback
         if len(tickers) < MAX_TICKERS:
             try:
                 url = f"https://www.alphavantage.co/query?function=LISTING_STATUS&apikey={ALPHA_VANTAGE_API_KEY}"
                 async with session.get(url, timeout=10) as response:
                     response.raise_for_status()
                     text = await response.text()
-                    # Process CSV from string
                     csv_data = StringIO(text)
                     data = pd.read_csv(csv_data)
-                    data = data[(data['status'] == 'Active') & 
-                               (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
-                               (data['assetType'] == 'Stock')]
+                    data = data[(data['status'] == 'Active') & (data['exchange'].isin(['NASDAQ', 'NYSE'])) & (data['assetType'] == 'Stock')]
                     tickers.extend(data['symbol'].tolist())
                     tickers = list(set(tickers))[:MAX_TICKERS]
                     logging.info(f"Fetched {len(tickers)} tickers from Alpha Vantage")
             except Exception as e:
                 log_error(f"Alpha Vantage fetch error: {e}")
 
-        # Fallback to Finviz document
+        # Fallback list
         if len(tickers) < 10:
-            try:
-                fallback_tickers = [
-                    'AACB', 'AACG', 'AACI', 'AACT', 'AAM', 'AAME', 'AAMI', 'AAOI', 'AARD', 'AAT',
-                    'AAUC', 'ABAT', 'ABCL', 'ABEO', 'ABL', 'ABLV', 'ABOS', 'ABP', 'ABSI', 'ABTS'
-                ]
-                tickers.extend([t for t in fallback_tickers if t not in tickers])
-                tickers = list(set(tickers))[:MAX_TICKERS]
-                logging.info(f"Added {len(tickers)} fallback tickers from Finviz")
-            except Exception as e:
-                log_error(f"Fallback Finviz document error: {e}")
+            fallback_tickers = ['AACB', 'AACG', 'AACI', 'AACT', 'AAM', 'AAME', 'AAMI', 'AAOI', 'AARD', 'AAT']
+            tickers.extend([t for t in fallback_tickers if t not in tickers])
+            tickers = list(set(tickers))[:MAX_TICKERS]
 
-    logging.info(f"Total fetched {len(tickers)} tickers")
     return tickers
 
 # ============================== #
@@ -179,17 +166,16 @@ async def fetch_tickers():
 # ============================== #
 
 def calculate_rsi(series, period=14):
-    """Calculate Relative Strength Index (RSI)."""
     delta = series.diff()
     gain = np.where(delta > 0, delta, 0)
     loss = np.where(delta < 0, -delta, 0)
-    avg_gain = pd.Series(gain).rolling(window=period, min_periods=1).mean()
-    avg_loss = pd.Series(loss).rolling(window=period, min_periods=1).mean()
+    avg_gain = pd.Series(gain).rolling(period, min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(period, min_periods=1).mean()
     rs = avg_gain / (avg_loss + 1e-9)
-    return 100 - (100 / (1 + rs)).iloc[-1]
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
 
 def calculate_atr(df, period=14):
-    """Calculate Average True Range (ATR)."""
     high_low = df["High"] - df["Low"]
     high_close = np.abs(df["High"] - df["Close"].shift())
     low_close = np.abs(df["Low"] - df["Close"].shift())
@@ -198,7 +184,6 @@ def calculate_atr(df, period=14):
     return true_range.rolling(period, min_periods=1).mean().iloc[-1]
 
 def kelly_criterion(win_prob=0.6, win_loss_ratio=2.0, max_fraction=0.15):
-    """Calculate Kelly Criterion position size."""
     f_star = win_prob - (1 - win_prob) / win_loss_ratio
     return max(0, min(f_star, max_fraction))
 
@@ -207,7 +192,6 @@ def kelly_criterion(win_prob=0.6, win_loss_ratio=2.0, max_fraction=0.15):
 # ============================== #
 
 async def get_google_trends(ticker):
-    """Fetch Google Trends data with retry logic."""
     for attempt in range(MAX_API_RETRIES):
         try:
             pytrens = TrendReq(hl='en-US', tz=360)
@@ -216,16 +200,13 @@ async def get_google_trends(ticker):
             if not data.empty:
                 return data[ticker].mean() / 100
         except Exception as e:
-            log_error(f"Google Trends error for {ticker} (attempt {attempt + 1}): {e}")
-            if attempt < MAX_API_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY)
+            log_error(f"Google Trends error {ticker} attempt {attempt + 1}: {e}")
+            await asyncio.sleep(RETRY_DELAY)
     return 0
 
 async def analyze_reddit_sentiment(ticker):
-    """Analyze Reddit sentiment using BERT."""
     try:
-        reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, 
-                            user_agent=REDDIT_USER_AGENT)
+        reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
         sentiment_analyzer = pipeline('sentiment-analysis', model='distilbert-base-uncased-finetuned-sst-2-english')
         sentiment = 0
         count = 0
@@ -244,7 +225,6 @@ async def analyze_reddit_sentiment(ticker):
 # ============================== #
 
 def prepare_features(df, info, vix_data=None):
-    """Prepare features for ML model, including VIX."""
     df = df.copy()
     df['returns'] = df['Close'].pct_change()
     df['ma_10'] = df['Close'].rolling(10).mean()
@@ -258,7 +238,6 @@ def prepare_features(df, info, vix_data=None):
     return df[['Close', 'ma_10', 'ma_50', 'rsi', 'atr', 'returns', 'short_interest', 'float', 'vix']]
 
 def build_lstm_model(input_shape):
-    """Build lightweight LSTM model."""
     model = Sequential()
     model.add(LSTM(30, input_shape=input_shape))
     model.add(Dropout(0.2))
@@ -267,7 +246,6 @@ def build_lstm_model(input_shape):
     return model
 
 async def analyze_ticker(ticker):
-    """Analyze a single ticker with ML and technical indicators."""
     try:
         ticker_obj = yf.Ticker(ticker)
         for attempt in range(MAX_API_RETRIES):
@@ -277,12 +255,8 @@ async def analyze_ticker(ticker):
                 vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
                 break
             except Exception as e:
-                log_error(f"Yahoo Finance error for {ticker} (attempt {attempt + 1}): {e}")
-                if attempt < MAX_API_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY)
-                else:
-                    return None
-
+                log_error(f"Yahoo Finance error for {ticker} attempt {attempt + 1}: {e}")
+                await asyncio.sleep(RETRY_DELAY)
         if df.empty or df['Volume'].iloc[-1] < VOLUME_THRESHOLD or info.get('marketCap', 0) < MARKET_CAP_THRESHOLD or info.get('floatShares', 0) > FLOAT_THRESHOLD:
             return None
 
@@ -365,7 +339,6 @@ async def analyze_ticker(ticker):
 # ============================== #
 
 async def scan_stocks():
-    """Scan cold stocks and select top 3 by score."""
     try:
         results = []
         cold_list = await fetch_tickers()
@@ -420,25 +393,4 @@ async def scan_stocks():
                 'entry_price': analysis['entry_price'],
                 'target_price': analysis['target_price'],
                 'stop_loss': analysis['stop_loss'],
-                'score': analysis['score'],
-                'predicted_gain': analysis['predicted_gain'],
-                'timestamp': timestamp
-            })
-
-        pd.DataFrame(output_data).to_csv(OUTPUT_FILE, index=False)
-        
-        await send_telegram(msg)
-        return top_results
-
-    except Exception as e:
-        log_error(f"Scan stocks error: {e}")
-        await send_telegram(f"⚠️ שגיאה בסריקה: {e}")
-        return []
-
-# ============================== #
-#         הרצת הסקריפט           #
-# ============================== #
-
-if __name__ == "__main__":
-    init_db()
-    asyncio.run(scan_stocks())
+               
