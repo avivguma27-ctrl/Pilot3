@@ -40,7 +40,7 @@ MARKET_CAP_THRESHOLD = 50_000_000
 FLOAT_THRESHOLD = 50_000_000
 MAX_API_RETRIES = 3
 RETRY_DELAY = 15
-MAX_TICKERS = 50
+MAX_TICKERS = 10  # הופחת ל-10 לבדיקה
 RATE_LIMIT_PER_MINUTE = 60
 
 logging.basicConfig(
@@ -107,6 +107,20 @@ async def send_telegram(msg):
     await send_telegram(f"⚠️ שגיאה: לא הצלחתי לשלוח התראה, בדוק את {LOG_FILE}")
 
 # ============================== #
+#         בדיקת Yahoo Finance     #
+# ============================== #
+
+async def check_yahoo_finance():
+    try:
+        df = yf.download("AAPL", period="1d", interval="1d", progress=False)
+        if df.empty:
+            raise Exception("Yahoo Finance returned empty data for AAPL")
+        return True
+    except Exception as e:
+        log_error(f"Yahoo Finance check failed: {e}")
+        return False
+
+# ============================== #
 #         משיכת טיקרים           #
 # ============================== #
 
@@ -114,26 +128,31 @@ async def fetch_tickers():
     tickers = []
     headers = {'User-Agent': 'Mozilla/5.0'}
     async with aiohttp.ClientSession(headers=headers) as session:
-        try:
-            exchanges = ['^IXIC', '^NYA']
-            for exchange in exchanges:
-                tickers_data = yf.Tickers(exchange)
-                for ticker_symbol in tickers_data.tickers:
-                    try:
-                        ticker = tickers_data.tickers[ticker_symbol]
-                        info = ticker.info
-                        if (info.get('regularMarketPrice', 0) <= 5.0 and
-                            info.get('regularMarketVolume', 0) >= VOLUME_THRESHOLD and
-                            info.get('exchange') in ['NAS', 'NYQ']):
-                            # בדיקה נוספת לוודא שהטיקר תקף
-                            df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
-                            if not df.empty:
-                                tickers.append(ticker_symbol)
-                    except Exception as e:
-                        log_error(f"Yahoo Finance ticker {ticker_symbol} error: {e}")
-            tickers = list(set(tickers))[:MAX_TICKERS]
-        except Exception as e:
-            log_error(f"Yahoo Finance fetch error: {e}")
+        if not await check_yahoo_finance():
+            log_error("Yahoo Finance is down, falling back to Alpha Vantage")
+        else:
+            try:
+                exchanges = ['^IXIC', '^NYA']
+                for exchange in exchanges:
+                    tickers_data = yf.Tickers(exchange)
+                    for ticker_symbol in tickers_data.tickers:
+                        if any(suffix in ticker_symbol for suffix in ['-WS', '-U', '-R', '-P-']):
+                            continue
+                        try:
+                            ticker = tickers_data.tickers[ticker_symbol]
+                            info = ticker.info
+                            if (info.get('regularMarketPrice', 0) <= 5.0 and
+                                info.get('regularMarketVolume', 0) >= VOLUME_THRESHOLD and
+                                info.get('exchange') in ['NAS', 'NYQ']):
+                                df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
+                                if not df.empty:
+                                    tickers.append(ticker_symbol)
+                            await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
+                        except Exception as e:
+                            log_error(f"Yahoo Finance ticker {ticker_symbol} error: {e}")
+                    tickers = list(set(tickers))[:MAX_TICKERS]
+            except Exception as e:
+                log_error(f"Yahoo Finance fetch error: {e}")
 
         if len(tickers) < MAX_TICKERS:
             try:
@@ -143,35 +162,42 @@ async def fetch_tickers():
                     text = await response.text()
                     csv_data = StringIO(text)
                     data = pd.read_csv(csv_data)
-                    data = data[(data['status'] == 'Active') & 
-                               (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
-                               (data['assetType'] == 'Stock')]
+                    data = data[
+                        (data['status'] == 'Active') & 
+                        (data['exchange'].isin(['NASDAQ', 'NYSE'])) & 
+                        (data['assetType'] == 'Stock') &
+                        (~data['symbol'].str.contains('-WS|-U|-R|-P-'))
+                    ]
                     for ticker_symbol in data['symbol'].tolist():
                         try:
                             df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
                             if not df.empty:
                                 tickers.append(ticker_symbol)
+                            await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
                         except Exception as e:
                             log_error(f"Alpha Vantage ticker {ticker_symbol} error: {e}")
                     tickers = list(set(tickers))[:MAX_TICKERS]
             except Exception as e:
                 log_error(f"Alpha Vantage fetch error: {e}")
 
-        if len(tickers) < 10:
+        if len(tickers) < 5:
             try:
-                fallback_tickers = ['AACB','AACG','AACI','AACT','AAM','AAME','AAMI','AAOI','AARD','AAT',
-                                    'AAUC','ABAT','ABCL','ABEO','ABL','ABLV','ABOS','ABP','ABSI','ABTS']
+                fallback_tickers = ['AACG', 'AAOI', 'AAME', 'AATC', 'ABAT', 'ABCB', 'ABIO', 'ABSI', 'ABVC', 'ACAD']
                 for ticker_symbol in fallback_tickers:
+                    if any(suffix in ticker_symbol for suffix in ['-WS', '-U', '-R', '-P-']):
+                        continue
                     try:
                         df = yf.download(ticker_symbol, period="1d", interval="1d", progress=False)
                         if not df.empty and ticker_symbol not in tickers:
                             tickers.append(ticker_symbol)
+                        await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
                     except Exception as e:
                         log_error(f"Fallback ticker {ticker_symbol} error: {e}")
                 tickers = list(set(tickers))[:MAX_TICKERS]
             except Exception as e:
                 log_error(f"Fallback tickers error: {e}")
 
+    logging.info(f"Fetched {len(tickers)} valid tickers")
     return tickers
 
 # ============================== #
@@ -199,6 +225,18 @@ def kelly_criterion(win_prob=0.6, win_loss_ratio=2.0, max_fraction=0.15):
     f_star = win_prob - (1 - win_prob) / win_loss_ratio
     return max(0, min(f_star, max_fraction))
 
+def build_lstm_model(input_shape):
+    model = Sequential([
+        LSTM(50, return_sequences=True, input_shape=input_shape),
+        Dropout(0.2),
+        LSTM(50),
+        Dropout(0.2),
+        Dense(25),
+        Dense(1)
+    ])
+    model.compile(optimizer='adam', loss='mse')
+    return model
+
 # ============================== #
 #      Google Trends + Reddit     #
 # ============================== #
@@ -206,11 +244,12 @@ def kelly_criterion(win_prob=0.6, win_loss_ratio=2.0, max_fraction=0.15):
 async def get_google_trends(ticker):
     for attempt in range(MAX_API_RETRIES):
         try:
-            pytrens = TrendReq(hl='en-US', tz=360)
-            pytrens.build_payload([ticker], timeframe='now 7-d')
-            data = pytrens.interest_over_time()
+            pytrends = TrendReq(hl='en-US', tz=360)
+            pytrends.build_payload([ticker], timeframe='now 7-d')
+            data = pytrends.interest_over_time()
             if not data.empty:
                 return data[ticker].mean() / 100
+            await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
         except Exception as e:
             log_error(f"Google Trends error for {ticker} (attempt {attempt + 1}): {e}")
             if attempt < MAX_API_RETRIES - 1:
@@ -229,6 +268,7 @@ async def analyze_reddit_sentiment(ticker):
             result = sentiment_analyzer(text[:512])[0]
             sentiment += result['score'] if result['label'] == 'POSITIVE' else -result['score']
             count += 1
+            await asyncio.sleep(1 / RATE_LIMIT_PER_MINUTE)
         return sentiment / count if count > 0 else 0
     except Exception as e:
         log_error(f"Reddit sentiment error for {ticker}: {e}")
@@ -251,113 +291,81 @@ def prepare_features(df, info, vix_data=None):
     df = df.dropna()
     return df[['Close', 'ma_10', 'ma_50', 'rsi', 'atr', 'returns', 'short_interest', 'float', 'vix']]
 
-def build_lstm_model(input_shape):
-    model = Sequential()
-    model.add(LSTM(20, input_shape=input_shape))  # הקטנת מספר הנוירונים ל-20 לשיפור ביצועים ב-CPU
-    model.add(Dropout(0.2))
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mse')
-    return model
-
 async def analyze_ticker(ticker):
     if not isinstance(ticker, str) or ticker.lower() == 'nan':
         log_error(f"Invalid ticker: {ticker}")
         return None
     try:
-        ticker_obj = yf.Ticker(ticker)
-        for attempt in range(MAX_API_RETRIES):
-            try:
-                info = ticker_obj.info
-                df = yf.download(ticker, period="6mo", interval="1d", progress=False)
-                vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
-                break
-            except Exception as e:
-                log_error(f"Yahoo Finance error for {ticker} (attempt {attempt + 1}): {e}")
-                if attempt < MAX_API_RETRIES - 1:
-                    await asyncio.sleep(RETRY_DELAY)
-                else:
-                    return None
+        async with asyncio.timeout(30):  # מגבלת זמן של 30 שניות
+            ticker_obj = yf.Ticker(ticker)
+            info = ticker_obj.info
+            df = ticker_obj.history(period="1y", interval="1d")
+            if df.empty or len(df) < 50:
+                log_error(f"No sufficient data for {ticker}")
+                return None
 
-        if df.empty or df['Volume'].iloc[-1] < VOLUME_THRESHOLD or info.get('marketCap', 0) < MARKET_CAP_THRESHOLD or info.get('floatShares', 0) > FLOAT_THRESHOLD:
-            return None
+            vix_data = yf.download("^VIX", period="1d", interval="1d", progress=False)
+            google_trend = await get_google_trends(ticker)
+            reddit_sentiment = await analyze_reddit_sentiment(ticker)
 
-        features_df = prepare_features(df, info, vix_data)
-        if features_df.empty:
-            return None
+            df_features = prepare_features(df, info, vix_data)
+            if df_features.empty:
+                log_error(f"No features for {ticker}")
+                return None
 
-        X = features_df[['ma_10', 'ma_50', 'rsi', 'atr', 'returns', 'short_interest', 'float', 'vix']]
-        y = features_df['Close']
+            X = df_features.drop(columns=['Close'])
+            y = df_features['Close']
+            tscv = TimeSeriesSplit(n_splits=5)
+            voting_model = VotingRegressor([
+                ('rf', RandomForestRegressor(n_estimators=100, random_state=42)),
+                ('gb', GradientBoostingRegressor(n_estimators=100, random_state=42)),
+                ('xgb', xgb.XGBRegressor(n_estimators=100, random_state=42))
+            ])
 
-        xgb_model = xgb.XGBRegressor(n_estimators=100, objective='reg:squarederror')
-        voting_model = VotingRegressor([
-            ('rf', RandomForestRegressor(n_estimators=50)),
-            ('gb', GradientBoostingRegressor(n_estimators=50)),
-            ('xgb', xgb_model)
-        ])
-        tscv = TimeSeriesSplit(n_splits=5)
-        scores = []
-        for train_idx, test_idx in tscv.split(X):
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
-            voting_model.fit(X_train, y_train)
-            pred = voting_model.predict(X_test)
-            scores.append(mean_squared_error(y_test, pred, squared=False))
-        avg_rmse = np.mean(scores)
-        if avg_rmse > 0.1 * y.iloc[-1]:
-            return None
+            mse_scores = []
+            for train_index, test_index in tscv.split(X):
+                X_train, X_test = X.iloc[train_index], X.iloc[test_index]
+                y_train, y_test = y.iloc[train_index], y.iloc[test_index]
+                voting_model.fit(X_train, y_train)
+                y_pred = voting_model.predict(X_test)
+                mse_scores.append(mean_squared_error(y_test, y_pred))
 
-        xgb_model.fit(X, y)
-        importance = {feature: score for feature, score in zip(X.columns, xgb_model.feature_importances_)}
-        importance_str = ", ".join(f"{k}: {v:.3f}" for k, v in importance.items())
+            # LSTM
+            X_lstm = X.values.reshape((X.shape[0], 1, X.shape[1]))
+            lstm_model = build_lstm_model((1, X.shape[1]))
+            lstm_model.fit(X_lstm[:-1], y.values[1:], epochs=5, batch_size=32, verbose=0)
 
-        X_lstm = X.values.reshape((X.shape[0], 1, X.shape[1]))
-        lstm_model = build_lstm_model((1, X.shape[1]))
-        lstm_model.fit(X_lstm[:-1], y.values[1:], epochs=5, batch_size=32, verbose=0)
-        voting_pred = voting_model.predict(X.iloc[[-1]])[0]
-        lstm_pred = lstm_model.predict(X_lstm[-1:], verbose=0)[0][0]
-        predicted_price = 0.7 * voting_pred + 0.3 * lstm_pred
-        predicted_gain = max((predicted_price - y.iloc[-1]) / y.iloc[-1], 0.05)
+            voting_pred = voting_model.predict(X.iloc[[-1]])[0]
+            lstm_pred = lstm_model.predict(X_lstm[-1:], verbose=0)[0][0]
+            predicted_price = 0.7 * voting_pred + 0.3 * lstm_pred
+            current_price = df['Close'].iloc[-1]
+            predicted_gain = (predicted_price - current_price) / current_price
 
-        last_close = df['Close'].iloc[-1]
-        atr = calculate_atr(df)
-        rsi = calculate_rsi(df['Close'])
-        ma_50 = df['Close'].rolling(50).mean().iloc[-1]
-        if rsi > RSI_COLD_THRESHOLD:
-            return None
+            atr = calculate_atr(df)
+            target_price = current_price + atr
+            stop_loss = current_price - atr
+            position_size = kelly_criterion()
 
-        google_trend = await get_google_trends(ticker)
-        reddit_sentiment = await analyze_reddit_sentiment(ticker)
-
-        score = min(1.0, 0.4 * (RSI_COLD_THRESHOLD - rsi) / RSI_COLD_THRESHOLD +
-                    0.3 * (1 - atr / last_close) + 0.2 * (last_close / ma_50) +
-                    0.05 * google_trend + 0.05 * reddit_sentiment +
-                    0.1 * (info.get('shortPercentOfFloat', 0) / 100))
-
-        days_in_trade = max(3, min(14, int(10 / max(atr / last_close, 0.01))))
-        win_prob = 0.6 + 0.1 * (info.get('shortPercentOfFloat', 0) > 20) + 0.1 * (rsi < 20)
-        position_size = kelly_criterion(win_prob=win_prob)
-
-        return {
-            "ticker": ticker,
-            "entry_price": last_close,
-            "target_price": last_close * (1 + predicted_gain),
-            "stop_loss": last_close - 2 * atr,
-            "score": score,
-            "predicted_gain": predicted_gain,
-            "days_in_trade": days_in_trade,
-            "position_size": position_size,
-            "google_trend": google_trend,
-            "reddit_sentiment": reddit_sentiment,
-            "short_interest": info.get('shortPercentOfFloat', 0),
-            "feature_importance": importance_str
-        }
-    except Exception as e:
-        log_error(f"Analyze ticker {ticker} failed: {e}")
+            return {
+                'ticker': ticker,
+                'current_price': current_price,
+                'predicted_price': predicted_price,
+                'predicted_gain': predicted_gain,
+                'target_price': target_price,
+                'stop_loss': stop_loss,
+                'score': np.mean(mse_scores) ** -0.5,
+                'position_size': position_size,
+                'google_trend': google_trend,
+                'reddit_sentiment': reddit_sentiment,
+                'short_interest': info.get('shortPercentOfFloat', 0),
+                'feature_importance': str(voting_model.estimators_[0].feature_importances_)
+            }
+    except asyncio.TimeoutError:
+        log_error(f"Timeout analyzing ticker {ticker}")
         return None
-
-# ============================== #
-#       סריקת מניות קרות        #
-# ============================== #
+    except Exception as e:
+        log_error(f"Analyze ticker {ticker} failed: {str(e)} - Data shape: {df.shape if 'df' in locals() and not df.empty else 'empty'}")
+        return None
 
 async def scan_stocks():
     try:
@@ -366,76 +374,37 @@ async def scan_stocks():
         if not cold_list:
             await send_telegram("⚠️ שגיאה: לא נמצאו טיקרים מתאימים")
             return []
-
+        logging.info(f"Starting analysis of {len(cold_list)} tickers")
         tasks = [analyze_ticker(ticker) for ticker in cold_list]
         analyses = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for analysis in analyses:
+        for i, analysis in enumerate(analyses):
+            logging.info(f"Processed ticker {cold_list[i]}: {'Success' if analysis and not isinstance(analysis, Exception) else 'Failed'}")
             if isinstance(analysis, Exception):
                 log_error(f"Analysis failed: {analysis}")
                 continue
             if analysis and analysis['predicted_gain'] > GAIN_THRESHOLD:
                 results.append(analysis)
-
-        top_results = sorted(results, key=lambda x: x['score'], reverse=True)[:3]
-        
-        if not top_results:
-            await send_telegram("⚠️ לא נמצאו מניות עם פוטנציאל מספיק גבוה")
-            return []
-
-        output_data = []
-        msg = "🏆 3 המניות המובילות:\n\n"
-        for analysis in top_results:
-            timestamp = datetime.utcnow().isoformat()
-            with sqlite3.connect(DB_FILE) as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT COUNT(*) FROM trades WHERE ticker=? AND timestamp=?", 
-                             (analysis['ticker'], timestamp))
-                if cursor.fetchone()[0] == 0:
-                    cursor.execute('''
-                        INSERT INTO trades 
-                        (ticker, entry_price, target_price, stop_loss, score, predicted_gain, 
-                         days_in_trade, position_size, timestamp, google_trend, reddit_sentiment, short_interest, feature_importance)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (analysis['ticker'], analysis['entry_price'], analysis['target_price'],
-                          analysis['stop_loss'], analysis['score'], analysis['predicted_gain'],
-                          analysis['days_in_trade'], analysis['position_size'], timestamp,
-                          analysis['google_trend'], analysis['reddit_sentiment'], analysis['short_interest'],
-                          analysis['feature_importance']))
-                    conn.commit()
-            
-            msg += (f"❄️ {analysis['ticker']} | כניסה: ${analysis['entry_price']:.2f} | "
-                    f"יעד: ${analysis['target_price']:.2f} | סטופ: ${analysis['stop_loss']:.2f} | "
-                    f"ציון: {analysis['score']:.2f} | תחזית עלייה: {analysis['predicted_gain']*100:.2f}% | "
-                    f"מאפיינים: {analysis['feature_importance']}\n\n")
-            
-            output_data.append({
-                'ticker': analysis['ticker'],
-                'entry_price': analysis['entry_price'],
-                'target_price': analysis['target_price'],
-                'stop_loss': analysis['stop_loss'],
-                'score': analysis['score'],
-                'predicted_gain': analysis['predicted_gain'],
-                'timestamp': timestamp
-            })
-
-        output_df = pd.DataFrame(output_data)
-        output_df.to_csv(OUTPUT_FILE, index=False)
-        await send_telegram(msg)
-        return top_results
-
+        if results:
+            df_results = pd.DataFrame(results)
+            df_results.to_csv(OUTPUT_FILE, index=False)
+            msg = f"📊 נמצאו {len(results)} מניות מבטיחות:\n"
+            for _, row in df_results.iterrows():
+                msg += (f"מניה: {row['ticker']}\n"
+                        f"מחיר נוכחי: ${row['current_price']:.2f}\n"
+                        f"תחזית רווח: {row['predicted_gain']*100:.2f}%\n"
+                        f"גודל פוזיציה: {row['position_size']*100:.2f}%\n\n")
+            await send_telegram(msg)
+        else:
+            await send_telegram("😕 לא נמצאו מניות עם פוטנציאל רווח מעל הסף")
+        return results
     except Exception as e:
-        log_error(f"Scan stocks failed: {e}")
-        await send_telegram(f"⚠️ שגיאה בסריקה: {e}")
+        log_error(f"Scan stocks error: {e}")
         return []
 
 # ============================== #
-#         הרצת הבוט           #
+#           הרצת הבוט            #
 # ============================== #
 
-async def main():
-    init_db()
-    await scan_stocks()
-
 if __name__ == "__main__":
-    asyncio.run(main())
+    init_db()
+    asyncio.run(scan_stocks())
